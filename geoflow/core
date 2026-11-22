@@ -1,0 +1,367 @@
+"""
+geoflow/core.py
+===============
+Physics and data handling for the geostrophic-flow project.
+
+What this file does
+-------------------
+1. Loads sea surface height (ADT) from a DUACS / Copernicus NetCDF file,
+   or builds a realistic synthetic ocean if you do not have a file yet.
+2. Turns the sea-surface slope into surface currents using geostrophic balance:
+
+        u = -(g / f) * d(eta)/dy        (eastward)
+        v =  (g / f) * d(eta)/dx        (northward)
+
+   where eta is the sea surface height, g is gravity and f = 2*Omega*sin(lat)
+   is the Coriolis parameter.
+3. Moves thousands of tracer particles through those currents (RK4 time
+   stepping), so the flow can be animated.
+
+Important physical point
+------------------------
+The geostrophic current does NOT run down the slope. It runs ALONG the
+contour lines of sea surface height, with high water on its right in the
+Northern Hemisphere. The shallow-water simulation (shallow_water.py) shows
+why: water first runs downhill, then the Earth's rotation turns it sideways.
+"""
+
+from dataclasses import dataclass, field
+
+import numpy as np
+import xarray as xr
+from scipy.ndimage import map_coordinates
+
+# ---------------------------------------------------------------------------
+# Constants
+# ---------------------------------------------------------------------------
+G = 9.81                    # gravity (m s^-2)
+OMEGA = 7.2921150e-5        # Earth's rotation rate (s^-1)
+R_EARTH = 6371000.0         # Earth radius (m)
+SECONDS_PER_DAY = 86400.0
+EQUATOR_MASK_DEG = 5.0      # f -> 0 at the equator, so geostrophy fails there
+
+
+# ---------------------------------------------------------------------------
+# Data container
+# ---------------------------------------------------------------------------
+@dataclass
+class OceanData:
+    """Sea surface height maps on a regular lat/lon grid."""
+    lat: np.ndarray                 # (ny,) degrees north, ascending
+    lon: np.ndarray                 # (nx,) degrees east
+    days: np.ndarray                # (nt,) days since the first map
+    labels: list                    # one text label per map (dates)
+    adt: np.ndarray                 # (nt, ny, nx) metres, NaN over land
+    source: str = "unknown"
+    official_u: np.ndarray = field(default=None, repr=False)   # DUACS 'ugos'
+    official_v: np.ndarray = field(default=None, repr=False)   # DUACS 'vgos'
+
+    @property
+    def shape(self):
+        return self.adt.shape
+
+
+# ---------------------------------------------------------------------------
+# Loading real data
+# ---------------------------------------------------------------------------
+_LAT_NAMES = ("latitude", "lat", "nav_lat", "y")
+_LON_NAMES = ("longitude", "lon", "nav_lon", "x")
+_SSH_NAMES = ("adt", "zos", "ssh", "sla")
+
+
+def _open_dataset(path):
+    """Try the usual NetCDF engines until one works.
+
+    (Your notebook failed with "unrecognized engine 'netcdf4'" because the
+    package was not installed. This tries several backends and gives a clear
+    message if none are available.)
+    """
+    errors = []
+    for engine in (None, "netcdf4", "h5netcdf", "scipy"):
+        try:
+            if engine is None:
+                return xr.open_dataset(path)
+            return xr.open_dataset(path, engine=engine)
+        except Exception as error:          # noqa: BLE001 - we report them all
+            errors.append(f"{engine or 'default'}: {error}")
+    raise RuntimeError(
+        "Could not open the NetCDF file. Try:  pip install netCDF4 h5netcdf\n"
+        + "\n".join(errors)
+    )
+
+
+def _pick(names, candidates, what):
+    for name in candidates:
+        if name in names:
+            return name
+    raise KeyError(f"Could not find the {what} variable. Found: {list(names)}")
+
+
+def load_netcdf(path, bbox=None, max_times=None):
+    """
+    Load ADT from a DUACS-style NetCDF file.
+
+    bbox      : (lon_min, lon_max, lat_min, lat_max) to crop the region
+    max_times : only keep the first N time steps
+    """
+    ds = _open_dataset(path)
+    names = set(ds.variables) | set(ds.dims)
+    lat_name = _pick(names, _LAT_NAMES, "latitude")
+    lon_name = _pick(names, _LON_NAMES, "longitude")
+    ssh_name = _pick(set(ds.data_vars), _SSH_NAMES, "sea surface height")
+    if ssh_name == "sla":
+        print("WARNING: only 'sla' (sea level anomaly) found. Currents from SLA "
+              "miss the mean flow. Use 'adt' for the full geostrophic current.")
+
+    def to_3d(var_name):
+        da = ds[var_name]
+        if "time" not in da.dims:
+            da = da.expand_dims("time")
+        da = da.transpose("time", lat_name, lon_name)
+        return da.values.astype(np.float64)
+
+    lat = ds[lat_name].values.astype(np.float64)
+    lon = ds[lon_name].values.astype(np.float64)
+    adt = to_3d(ssh_name)
+    official_u = to_3d("ugos") if "ugos" in ds.data_vars else None
+    official_v = to_3d("vgos") if "vgos" in ds.data_vars else None
+
+    # time axis -> "days since start" plus readable labels
+    if "time" in ds.variables and np.issubdtype(ds["time"].dtype, np.datetime64):
+        t = ds["time"].values
+        days = (t - t[0]) / np.timedelta64(1, "D")
+        labels = [str(x)[:10] for x in np.datetime_as_string(t, unit="D")]
+    else:
+        n = adt.shape[0]
+        days = np.arange(n, dtype=float)
+        labels = [f"step {i}" for i in range(n)]
+    days = np.asarray(days, dtype=float)
+
+    # latitude must increase with index
+    if lat[0] > lat[-1]:
+        lat = lat[::-1]
+        adt = adt[:, ::-1, :]
+        if official_u is not None:
+            official_u, official_v = official_u[:, ::-1, :], official_v[:, ::-1, :]
+
+    # crop
+    if bbox is not None:
+        lon_min, lon_max, lat_min, lat_max = bbox
+        ix = (lon >= lon_min) & (lon <= lon_max)
+        iy = (lat >= lat_min) & (lat <= lat_max)
+        lat, lon = lat[iy], lon[ix]
+        adt = adt[:, iy][:, :, ix]
+        if official_u is not None:
+            official_u = official_u[:, iy][:, :, ix]
+            official_v = official_v[:, iy][:, :, ix]
+    if max_times is not None:
+        adt, days, labels = adt[:max_times], days[:max_times], labels[:max_times]
+        if official_u is not None:
+            official_u, official_v = official_u[:max_times], official_v[:max_times]
+
+    _check_uniform(lat, "latitude")
+    _check_uniform(lon, "longitude")
+    return OceanData(lat, lon, days, labels, adt, source=str(path),
+                     official_u=official_u, official_v=official_v)
+
+
+def _check_uniform(axis, name):
+    steps = np.diff(axis)
+    if len(steps) and not np.allclose(steps, steps.mean(), rtol=1e-3):
+        raise ValueError(f"{name} grid is not regularly spaced; "
+                         "the tracer code needs a uniform grid.")
+
+
+# ---------------------------------------------------------------------------
+# Synthetic ocean (used when no file is given)
+# ---------------------------------------------------------------------------
+def synthetic_ocean(nt=90, seed=7):
+    """
+    A Gulf-Stream-like test ocean on a 0.25-degree grid (the DUACS resolution):
+      * a meandering jet (sharp sea-surface step, meanders drift downstream)
+      * warm-core rings (high water) south of the jet, cold-core rings (low
+        water) north of it, all slowly drifting
+      * weak background mesoscale variability
+      * land in the north-west corner
+    Heights are in metres. This is made-up data for demos and tests.
+    """
+    lat = np.arange(30.0, 48.0, 0.25)          # 72 points
+    lon = np.arange(-72.0, -40.0, 0.25)        # 128 points
+    LON, LAT = np.meshgrid(lon, lat)
+    days = np.arange(nt, dtype=float)
+    rng = np.random.default_rng(seed)
+
+    # (lon0, lat0, amplitude m, radius deg, lon drift deg/day, lat drift deg/day)
+    eddies = [
+        (-62.0, 36.0,  0.40, 1.1, -0.045, -0.010),
+        (-52.0, 35.2,  0.35, 1.3, -0.035, -0.008),
+        (-45.0, 33.6,  0.30, 1.0, -0.030, -0.005),
+        (-58.0, 42.4, -0.38, 1.0, -0.040,  0.004),
+        (-47.0, 41.6, -0.33, 1.2, -0.030,  0.000),
+    ]
+    # a few random wave-like modes for background variability
+    modes = [(rng.uniform(0.5, 1.6), rng.uniform(0.5, 1.6),
+              rng.uniform(0, 2 * np.pi), rng.uniform(0.02, 0.045))
+             for _ in range(12)]
+
+    adt = np.empty((nt, len(lat), len(lon)))
+    for k, t in enumerate(days):
+        # jet axis with meanders that travel east
+        centre = 37.5 + 0.12 * (LON + 72) \
+            + (0.4 + 0.07 * (LON + 72)) * np.sin(2 * np.pi * (LON + 72 - 0.11 * t) / 9.0)
+        eta = 0.5 - 0.6 * np.tanh((LAT - centre) / 0.55)
+        for lon0, lat0, amp, rad, dlon, dlat in eddies:
+            x = (LON - (lon0 + dlon * t)) * np.cos(np.radians(LAT))
+            y = LAT - (lat0 + dlat * t)
+            eta += amp * np.exp(-(x ** 2 + y ** 2) / (2 * rad ** 2))
+        for kx, ky, phase, amp in modes:
+            eta += amp * np.cos(kx * (LON + 0.05 * t) + ky * LAT + phase)
+        adt[k] = eta
+
+    # a curvy coastline in the north-west plus an island at the top edge
+    land = (LAT > 40.0 + 0.5 * (LON + 72) + 0.6 * np.sin(1.1 * (LON + 72))) & (LON < -56)
+    land |= (((LON + 54.0) / 2.4) ** 2 + ((LAT - 48.0) / 2.0) ** 2) < 1.0
+    adt[:, land] = np.nan
+    labels = [f"Day {int(d):02d}" for d in days]
+    return OceanData(lat, lon, days, labels, adt, source="synthetic demo ocean")
+
+
+# ---------------------------------------------------------------------------
+# Geostrophic velocity
+# ---------------------------------------------------------------------------
+def _ddx(field, lat, lon):
+    """d/dx in 1/m on the sphere:  (1 / (R cos(lat))) * d/d(lon)."""
+    phi = np.deg2rad(lat)
+    return np.gradient(field, np.deg2rad(lon), axis=-1) / (R_EARTH * np.cos(phi))[:, None]
+
+
+def _ddy(field, lat):
+    """d/dy in 1/m on the sphere:  (1 / R) * d/d(lat)."""
+    return np.gradient(field, np.deg2rad(lat), axis=-2) / R_EARTH
+
+
+def coriolis(lat):
+    return 2.0 * OMEGA * np.sin(np.deg2rad(lat))
+
+
+def geostrophic_velocity(adt, lat, lon, equator_mask_deg=EQUATOR_MASK_DEG):
+    """
+    Surface currents from sea surface height.
+
+    adt : (..., ny, nx) array in metres (NaN allowed)
+    Returns u (eastward) and v (northward) in m/s, same shape as adt.
+    Cells within `equator_mask_deg` of the equator are set to NaN.
+    """
+    f = coriolis(lat)[:, None]
+    with np.errstate(divide="ignore", invalid="ignore"):   # f = 0 exactly on the equator
+        u = -(G / f) * _ddy(adt, lat)
+        v = (G / f) * _ddx(adt, lat, lon)
+    bad = np.abs(lat) < equator_mask_deg
+    u[..., bad, :] = np.nan
+    v[..., bad, :] = np.nan
+    return u, v
+
+
+def relative_vorticity(u, v, lat, lon):
+    """zeta = dv/dx - du/dy + u tan(lat)/R   (s^-1). Positive = anticlockwise."""
+    tan_term = u * np.tan(np.deg2rad(lat))[:, None] / R_EARTH
+    return _ddx(v, lat, lon) - _ddy(u, lat) + tan_term
+
+
+def rossby_number(u, v, lat, lon):
+    """zeta / f : how strongly the flow rotates compared with the Earth."""
+    return relative_vorticity(u, v, lat, lon) / coriolis(lat)[:, None]
+
+
+def compare_with_official(data, u, v):
+    """If the file contains DUACS 'ugos'/'vgos', see how close we are to them."""
+    if data.official_u is None:
+        return None
+    ok = np.isfinite(u) & np.isfinite(v) & np.isfinite(data.official_u) & np.isfinite(data.official_v)
+    if not ok.any():
+        return None
+    mine = np.concatenate([u[ok], v[ok]])
+    theirs = np.concatenate([data.official_u[ok], data.official_v[ok]])
+    return {
+        "correlation": float(np.corrcoef(mine, theirs)[0, 1]),
+        "rmse_m_per_s": float(np.sqrt(np.mean((mine - theirs) ** 2))),
+        "points": int(ok.sum()),
+    }
+
+
+# ---------------------------------------------------------------------------
+# Tracer particles
+# ---------------------------------------------------------------------------
+class TracerAdvector:
+    """Moves particles through time-varying surface currents (RK4)."""
+
+    def __init__(self, data, u, v):
+        self.lat0, self.lon0 = data.lat[0], data.lon[0]
+        self.dlat = data.lat[1] - data.lat[0]
+        self.dlon = data.lon[1] - data.lon[0]
+        self.ny, self.nx = len(data.lat), len(data.lon)
+        self.days = data.days
+        self.ocean = np.isfinite(u).all(axis=0) & np.isfinite(v).all(axis=0)
+        self.u = np.nan_to_num(u)
+        self.v = np.nan_to_num(v)
+
+    # -- velocity lookup ---------------------------------------------------
+    def fields_at(self, t):
+        """u, v maps at time t (days), linearly interpolated between maps."""
+        nt = len(self.days)
+        if nt == 1:
+            return self.u[0], self.v[0]
+        t = float(np.clip(t, self.days[0], self.days[-1]))
+        k = int(np.searchsorted(self.days, t, side="right") - 1)
+        k = min(max(k, 0), nt - 2)
+        w = (t - self.days[k]) / (self.days[k + 1] - self.days[k])
+        return (1 - w) * self.u[k] + w * self.u[k + 1], (1 - w) * self.v[k] + w * self.v[k + 1]
+
+    def sample(self, t, lon, lat):
+        """Bilinear interpolation of the currents at particle positions."""
+        ut, vt = self.fields_at(t)
+        coords = np.array([(lat - self.lat0) / self.dlat, (lon - self.lon0) / self.dlon])
+        return (map_coordinates(ut, coords, order=1, mode="nearest"),
+                map_coordinates(vt, coords, order=1, mode="nearest"))
+
+    # -- time stepping -----------------------------------------------------
+    def step(self, t, lon, lat, dt_days):
+        """One 4th-order Runge-Kutta step. Positions in degrees, t in days."""
+        dt = dt_days * SECONDS_PER_DAY
+
+        def rate(tt, lo, la):
+            uu, vv = self.sample(tt, lo, la)
+            dlon = np.degrees(uu / (R_EARTH * np.cos(np.radians(la))))   # deg/s
+            dlat = np.degrees(vv / R_EARTH)                              # deg/s
+            return dlon, dlat
+
+        k1 = rate(t, lon, lat)
+        k2 = rate(t + dt_days / 2, lon + 0.5 * dt * k1[0], lat + 0.5 * dt * k1[1])
+        k3 = rate(t + dt_days / 2, lon + 0.5 * dt * k2[0], lat + 0.5 * dt * k2[1])
+        k4 = rate(t + dt_days, lon + dt * k3[0], lat + dt * k3[1])
+        new_lon = lon + dt / 6.0 * (k1[0] + 2 * k2[0] + 2 * k3[0] + k4[0])
+        new_lat = lat + dt / 6.0 * (k1[1] + 2 * k2[1] + 2 * k3[1] + k4[1])
+        return new_lon, new_lat
+
+    # -- helpers -----------------------------------------------------------
+    def in_ocean(self, lon, lat):
+        """True where the particle is inside the grid and over water."""
+        iy = np.rint((lat - self.lat0) / self.dlat).astype(int)
+        ix = np.rint((lon - self.lon0) / self.dlon).astype(int)
+        inside = (iy >= 0) & (iy < self.ny) & (ix >= 0) & (ix < self.nx)
+        result = np.zeros(lon.shape, dtype=bool)
+        result[inside] = self.ocean[iy[inside], ix[inside]]
+        return result
+
+    def random_positions(self, n, rng):
+        """n random positions over open water."""
+        cells = np.argwhere(self.ocean)
+        pick = cells[rng.integers(0, len(cells), n)]
+        jitter = rng.uniform(-0.5, 0.5, (n, 2))
+        lat = self.lat0 + (pick[:, 0] + jitter[:, 0]) * self.dlat
+        lon = self.lon0 + (pick[:, 1] + jitter[:, 1]) * self.dlon
+        return lon, lat
+
+    def to_cell_coords(self, lon, lat):
+        """Fractional grid indices (ix, iy) of particle positions."""
+        return (lon - self.lon0) / self.dlon, (lat - self.lat0) / self.dlat
