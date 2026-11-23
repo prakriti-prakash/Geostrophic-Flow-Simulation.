@@ -1,0 +1,158 @@
+"""Tests for geoflow.core - each one checks a piece of physics against a known answer."""
+
+import numpy as np
+import pytest
+import xarray as xr
+
+from geoflow import core
+
+LAT = np.arange(35.0, 45.0, 0.25)
+LON = np.arange(-60.0, -50.0, 0.25)
+
+
+def test_north_south_slope_gives_eastward_current():
+    """Height rising northward at s metres per metre -> u = -(g/f) * s, v = 0."""
+    s = 1e-6
+    y = np.deg2rad(LAT - 40.0) * core.R_EARTH
+    eta = np.tile(s * y[:, None], (1, len(LON)))
+    u, v = core.geostrophic_velocity(eta, LAT, LON)
+    expected_u = -(core.G / core.coriolis(LAT)) * s
+    np.testing.assert_allclose(u, np.tile(expected_u[:, None], (1, len(LON))), rtol=1e-9)
+    np.testing.assert_allclose(v, 0.0, atol=1e-12)
+
+
+def test_east_west_slope_gives_northward_current():
+    """eta = s * (distance east at 40N): v = (g/f) * s * cos(40N) / cos(lat)."""
+    s = 1e-6
+    phi0 = np.deg2rad(40.0)
+    x = np.deg2rad(LON + 55.0) * core.R_EARTH * np.cos(phi0)
+    eta = np.tile(s * x[None, :], (len(LAT), 1))
+    u, v = core.geostrophic_velocity(eta, LAT, LON)
+    expected_v = (core.G / core.coriolis(LAT)) * s * np.cos(phi0) / np.cos(np.deg2rad(LAT))
+    np.testing.assert_allclose(v, np.tile(expected_v[:, None], (1, len(LON))), rtol=1e-9)
+    np.testing.assert_allclose(u, 0.0, atol=1e-12)
+
+
+def test_flow_runs_along_height_contours_not_down_the_slope():
+    """The key physical fact: velocity is perpendicular to the height gradient."""
+    data = core.synthetic_ocean(nt=2)
+    eta = data.adt[0]
+    u, v = core.geostrophic_velocity(eta, data.lat, data.lon)
+    dx = core._ddx(eta, data.lat, data.lon)
+    dy = core._ddy(eta, data.lat)
+    along_gradient = u * dx + v * dy            # = 0 if flow follows the contours
+    scale = np.nanmax(np.hypot(u, v)) * np.nanmax(np.hypot(dx, dy))
+    assert np.nanmax(np.abs(along_gradient)) < 1e-9 * scale
+
+
+def test_high_water_is_on_the_right_in_the_northern_hemisphere():
+    """East of a hill of water the current must flow south (clockwise around it)."""
+    LON2, LAT2 = np.meshgrid(LON, LAT)
+    eta = np.exp(-(((LON2 + 55) * np.cos(np.deg2rad(40))) ** 2 + (LAT2 - 40) ** 2) / 2.0)
+    u, v = core.geostrophic_velocity(eta, LAT, LON)
+    j, i = np.argmin(np.abs(LAT - 40)), np.argmin(np.abs(LON - (-53.5)))
+    assert v[j, i] < 0                          # southward on the east side
+    assert u[np.argmin(np.abs(LAT - 41.5)), np.argmin(np.abs(LON + 55))] > 0   # eastward on the north side
+
+
+def test_equator_is_masked():
+    lat = np.arange(-10.0, 10.0, 0.25)
+    eta = np.random.default_rng(0).normal(size=(len(lat), 8))
+    u, v = core.geostrophic_velocity(eta, lat, np.arange(8) * 0.25)
+    assert np.all(np.isnan(u[np.abs(lat) < core.EQUATOR_MASK_DEG]))
+    assert np.all(np.isfinite(u[np.abs(lat) > core.EQUATOR_MASK_DEG + 0.5]))
+
+
+def test_vorticity_of_solid_body_rotation():
+    """u = -a*y, v = a*x has vorticity 2a (checked on a small patch)."""
+    lat = np.arange(39.0, 41.0, 0.1)
+    lon = np.arange(-56.0, -54.0, 0.1)
+    a = 1e-5
+    y = np.deg2rad(lat - 40.0) * core.R_EARTH
+    x = np.deg2rad(lon + 55.0) * core.R_EARTH * np.cos(np.deg2rad(40.0))
+    u = np.tile((-a * y)[:, None], (1, len(lon)))
+    v = np.tile((a * x)[None, :], (len(lat), 1))
+    zeta = core.relative_vorticity(u, v, lat, lon)
+    centre = zeta[5:-5, 5:-5]
+    np.testing.assert_allclose(centre, 2 * a, rtol=0.03)
+
+
+def test_synthetic_ocean_is_sensible():
+    d = core.synthetic_ocean(nt=5)
+    assert d.adt.shape == (5, 72, 128)
+    land = ~np.isfinite(d.adt[0])
+    assert 0.03 < land.mean() < 0.25
+    u, v = core.geostrophic_velocity(d.adt, d.lat, d.lon)
+    peak = np.nanmax(np.hypot(u, v))
+    assert 0.5 < peak < 3.5                     # western-boundary-current-like speeds
+
+
+def _tiny_data(u0=0.0, nt=1):
+    lat, lon = np.arange(35.0, 45.0, 0.25), np.arange(-60.0, -50.0, 0.25)
+    adt = np.zeros((nt, len(lat), len(lon)))
+    return core.OceanData(lat, lon, np.arange(nt, dtype=float) * 10.0,
+                          [str(i) for i in range(nt)], adt)
+
+
+def test_tracer_in_uniform_eastward_flow_moves_the_right_distance():
+    data = _tiny_data()
+    u = np.full(data.adt.shape, 0.5)             # 0.5 m/s east everywhere
+    v = np.zeros_like(u)
+    adv = core.TracerAdvector(data, u, v)
+    lon, lat = np.array([-55.0]), np.array([40.0])
+    for _ in range(20):
+        lon, lat = adv.step(0.0, lon, lat, 0.1)  # 2 days in total
+    metres = 0.5 * 2 * core.SECONDS_PER_DAY
+    expected = np.degrees(metres / (core.R_EARTH * np.cos(np.radians(40.0))))
+    assert lon[0] + 55.0 == pytest.approx(expected, rel=1e-6)
+    assert lat[0] == pytest.approx(40.0, abs=1e-9)
+
+
+def test_velocity_is_interpolated_in_time():
+    data = _tiny_data(nt=2)
+    u = np.zeros(data.adt.shape)
+    u[1] = 1.0                                   # 0 m/s at day 0, 1 m/s at day 10
+    adv = core.TracerAdvector(data, u, np.zeros_like(u))
+    uu, _ = adv.sample(5.0, np.array([-55.0]), np.array([40.0]))
+    assert uu[0] == pytest.approx(0.5)
+
+
+def test_particles_over_land_or_outside_are_flagged():
+    d = core.synthetic_ocean(nt=2)
+    u, v = core.geostrophic_velocity(d.adt, d.lat, d.lon)
+    adv = core.TracerAdvector(d, u, v)
+    lon = np.array([-70.0, -55.0, -100.0])       # land corner, open ocean, outside grid
+    lat = np.array([46.0, 37.0, 37.0])
+    assert list(adv.in_ocean(lon, lat)) == [False, True, False]
+
+
+def test_netcdf_roundtrip_with_descending_latitude_and_official_currents(tmp_path):
+    """Write a DUACS-style file (latitude descending, ugos/vgos present) and read it back."""
+    d = core.synthetic_ocean(nt=3)
+    u, v = core.geostrophic_velocity(d.adt, d.lat, d.lon)
+    times = np.datetime64("2020-01-01") + np.arange(3).astype("timedelta64[D]")
+    dims = ("time", "latitude", "longitude")
+    ds = xr.Dataset(
+        {"adt": (dims, d.adt[:, ::-1]), "ugos": (dims, u[:, ::-1]), "vgos": (dims, v[:, ::-1])},
+        coords={"time": times, "latitude": d.lat[::-1], "longitude": d.lon})
+    path = tmp_path / "duacs_like.nc"
+    ds.to_netcdf(path)
+
+    loaded = core.load_netcdf(path)
+    assert loaded.lat[0] < loaded.lat[-1]                       # flipped to ascending
+    np.testing.assert_allclose(loaded.adt, d.adt, equal_nan=True)
+    assert loaded.labels[0] == "2020-01-01"
+    np.testing.assert_allclose(loaded.days, [0, 1, 2])
+    mine_u, mine_v = core.geostrophic_velocity(loaded.adt, loaded.lat, loaded.lon)
+    check = core.compare_with_official(loaded, mine_u, mine_v)
+    assert check["correlation"] > 0.999999
+
+
+def test_irregular_grid_is_rejected(tmp_path):
+    lat = np.array([35.0, 35.25, 35.5, 36.5, 37.0])
+    ds = xr.Dataset({"adt": (("latitude", "longitude"), np.zeros((5, 4)))},
+                    coords={"latitude": lat, "longitude": np.arange(4) * 0.25})
+    path = tmp_path / "bad.nc"
+    ds.to_netcdf(path)
+    with pytest.raises(ValueError):
+        core.load_netcdf(path)
