@@ -1,0 +1,56 @@
+"""
+ORIGINAL VERSION (first attempt) - kept for reference.
+
+Known problems this version had (all fixed in geoflow/core.py):
+  * np.gradient was given a per-latitude dx array as the column spacing, which
+    only works when nlat == nlon and is wrong even then.
+  * No protection near the equator, where f -> 0 and u, v blow up.
+  * Land / missing values were not handled.
+  * Only a single time step was used, so nothing moved.
+"""
+# Requires: xarray, numpy, matplotlib
+import xarray as xr
+import numpy as np
+import matplotlib.pyplot as plt
+
+# constants
+g = 9.81
+Omega = 7.2921150e-5  # Earth's rotation rate (s^-1)
+
+# 1) OPEN YOUR FILE
+ds = xr.open_dataset("dataset.nc", engine="netcdf4")
+
+# DUACS variables:
+# SSH = ADT (absolute dynamic topography)
+ssh = ds["adt"].isel(time=0)         # pick first time slice
+lat = ds["latitude"]
+lon = ds["longitude"]
+
+# 2) Coriolis parameter f
+phi = np.deg2rad(lat)
+f = 2 * Omega * np.sin(phi)
+
+# 3) Spatial gradient (convert lat/lon -> meters)
+R = 6371000.0
+dx = (np.deg2rad(lon[1] - lon[0]) * R * np.cos(np.deg2rad(lat)))
+dy = (np.deg2rad(lat[1] - lat[0]) * R)
+
+ssh2d = ssh.values
+
+# Gradient of SSH
+dssh_dy, dssh_dx = np.gradient(ssh2d, dy, dx, edge_order=2)
+
+# 4) Geostrophic velocities
+f2d = np.broadcast_to(f.values[:, None], ssh2d.shape)
+
+ug = - (g / f2d) * dssh_dy   # eastward
+vg =   (g / f2d) * dssh_dx   # northward
+
+# 5) Plot streamlines
+plt.figure(figsize=(12, 6))
+plt.streamplot(lon, lat, ug, vg, density=1.2)
+plt.contour(lon, lat, ssh2d, levels=15, alpha=0.7)
+plt.title("Geostrophic Streamlines from ADT (SSH)")
+plt.xlabel("Longitude")
+plt.ylabel("Latitude")
+plt.show()
